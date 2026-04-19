@@ -8,6 +8,9 @@ from torchvision.datasets import CocoDetection, wrap_dataset_for_transforms_v2
 from torch.utils.data import Dataset, DataLoader
 from scipy.optimize import linear_sum_assignment
 
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
 from torchvision.models import resnet50
 from torchvision.models import ResNet50_Weights
 
@@ -57,6 +60,13 @@ def parse_cmd():
         "--annotation_path",
         type=str,
         help="Select annotation file path, input for training, output for inference"
+    )
+
+    parser.add_argument(
+        "--model_path",
+        defualt=None,
+        type=str,
+        help="Specify model weight file to load for inference"
     )
 
     return parser.parse_args()
@@ -334,6 +344,46 @@ def iou_loss(box_pred, targets, indices):
     loss = 1 - torch.diag(giou)
     return loss.sum() / num_boxes
 
+def get_pred_rows_batch(class_logits, boxes_cxcywh, class_count, image_ids, scale):
+    probs = class_logits.softmax(-1)                 # [B, Q, C+1]
+    scores, cls_idx = probs.max(dim=-1)              # [B, Q], [B, Q]
+
+    keep = cls_idx != class_count                    # [B, Q]
+
+    boxes_xywh = box_convert(
+        boxes_cxcywh,
+        in_fmt="cxcywh",
+        out_fmt="xywh"
+    ) * scale                                        # [B, Q, 4]
+
+    rows = []
+    B, Q, _ = boxes_xywh.shape
+
+    for b in range(B):
+        kept_boxes = boxes_xywh[b][keep[b]]
+        kept_scores = scores[b][keep[b]]
+        kept_cls = cls_idx[b][keep[b]] + 1
+
+        for box, score, category_id in zip(kept_boxes, kept_scores, kept_cls):
+            rows.append({
+                "image_id": int(image_ids[b]),
+                "bbox": box.tolist(),
+                "score": float(score.item()),
+                "category_id": int(category_id.item()),
+            })
+
+    return rows
+
+def compute_map(annotations, predictions):
+    gt = COCO(annotations)
+    dt = gt.loadRes(predictions)
+    evaluator = COCOeval(gt, dt, iouType="bbox")
+    evaluator.evaluate()
+    evaluator.accumulate()
+    evaluator.summarize()
+
+    return evaluator
+
 if __name__ == '__main__':
     args = parse_cmd()
 
@@ -343,6 +393,11 @@ if __name__ == '__main__':
     model = DETR(class_count=10, query_count=50).to(device)
     
     assert(model is not None)
+
+    if args.model_path is not None:
+        state_dict = torch.load(args.model_path, map_location=device)
+        model.load_state_dict(state_dict)
+        print(f"Loaded weights from {args.model_path}")
 
     if args.mode == RunMode.TRAIN:
         training_ann = Path("/".join([args.annotation_path, "train.json"]))
@@ -354,6 +409,12 @@ if __name__ == '__main__':
         
     basic_transforms = T.Compose([
         T.ToImage(),
+        T.RandomIoUCrop(),
+        T.RandomAffine(
+            degrees=5,
+            translate=(0.05, 0.05),
+            scale=(0.95, 1.05),
+        ),
         T.Resize((224, 224)),
         T.ToDtype(torch.float32, scale=True),
         T.SanitizeBoundingBoxes()
@@ -400,7 +461,7 @@ if __name__ == '__main__':
     }
 
     matcher = Matcher()
-    num_epochs = 10
+    num_epochs = 50
     epoch_data = []
     print(f"Beginning training with {str(num_epochs)} epochs")
     for epoch in range(num_epochs):
@@ -409,7 +470,8 @@ if __name__ == '__main__':
         training_loss = 0.0
         print(f"Training in {len(loaders['training'])} batches")
         counter = 0
-
+        training_out_rows = []
+        validate_out_rows = []
         for image_arr, target_arr in loaders['training']:
             if counter%100 == 0:
                 print(f"Beginning batch {counter+1}")
@@ -438,8 +500,20 @@ if __name__ == '__main__':
             optimizer.step()
             training_loss+=loss.item()
             
+            image_ids = [t["image_id"] for t in target_arr]
+            rows = get_pred_rows_batch(
+                class_pred, 
+                box_pred, 
+                model.class_count, 
+                image_ids, 
+                scale
+            )
+            training_out_rows.extend(rows)
+
             counter+=1
         training_loss /= len(loaders["training"])
+        compute_map(training_ann,training_out_rows)
+        train_map_score = evaluator.stats[0]
 
         print("Training Complete. Begin Validate")
         model.eval()
@@ -457,28 +531,47 @@ if __name__ == '__main__':
                 scale = torch.tensor([W, H, W, H], dtype=targets[0]["boxes"].dtype, device=device)
                 
                 targets = [{
-                    "boxes": t["boxes"] / scale,
-                    "labels": t["labels"],
-                } for t in targets
-            ]
-                class_pred, box_pred = model(images)
+                        "boxes": t["boxes"] / scale,
+                        "labels": t["labels"],
+                    } for t in targets
+                ]
+                v_class_pred, v_box_pred = model(images)
 
-                indices = matcher(class_pred, box_pred, targets)
+                indices = matcher(v_class_pred, v_box_pred, targets)
 
-                loss_class = class_loss(class_pred, targets, indices, model.class_count)
-                loss_bbox = bbox_loss(box_pred, targets, indices)
-                loss_IoU = iou_loss(box_pred, targets, indices)
+                loss_class = class_loss(v_class_pred, targets, indices, model.class_count)
+                loss_bbox = bbox_loss(v_box_pred, targets, indices)
+                loss_IoU = iou_loss(v_box_pred, targets, indices)
                 loss = loss_class + loss_bbox + loss_IoU
 
                 validate_loss+=loss.item()
+
+                image_ids = [t["image_id"] for t in target_arr]
+                rows = get_pred_rows_batch(
+                    v_class_pred,
+                    v_box_pred,
+                    model.class_count,
+                    image_ids,
+                    scale
+                )
+                validate_out_rows.extend(rows)
+
                 counter += 1
 
         validate_loss /= len(loaders["validate"])
+        
+        evaluator = compute_map(validate_ann, validate_out_rows)
+        val_map_score = evaluator.stats[0]
         print("Validation Complete.")
 
         print(f"End Epoch {epoch + 1} of {num_epochs}")
         print(f"Training Loss: {training_loss:0.3f}\t Validate Loss: {validate_loss:0.3f}")
-        epoch_data.append((round(training_loss,3), round(validate_loss,3)))
+        epoch_data.append((
+            round(training_loss,3), 
+            round(validate_loss,3), 
+            round(train_map_score, 3),
+            round(val_map_score,3)))
+
 
 
         torch.save(model.state_dict(),f"tmp_weights{str(epoch)}.pt")
