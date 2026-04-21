@@ -72,5 +72,4 @@ python code/src/entry.py --mode=infer --root_dir=nycu-hw2-data --annotation_path
 ```
 
 # Performance Snapshot
-[![Result](competition.png)]
-
+[![Result](competition.jpg)]
